@@ -113,22 +113,37 @@ export function printText(title, s, all = false) {
 
 function main() {
   const args = process.argv.slice(2);
+  const usage = 'usage: graph-query.mjs <projectRoot> chain "<query>" | impact <path>... [--depth N] [--json]';
   const flags = args.filter(a => a.startsWith('--'));
-  const pos = args.filter(a => !a.startsWith('--'));
   const depthIdx = args.indexOf('--depth');
-  const depth = depthIdx >= 0 ? Number(args[depthIdx + 1]) : 3;
-  if (depthIdx >= 0) pos.splice(pos.indexOf(args[depthIdx + 1]), 1);
+  let depth = 3;
+  if (depthIdx >= 0) {
+    const value = args[depthIdx + 1];
+    depth = Number(value);
+    if (value === undefined || value.trim() === '' || !Number.isInteger(depth) || depth < 1) {
+      console.error(usage);
+      process.exit(1);
+    }
+  }
+  const pos = args.filter((a, i) => !a.startsWith('--') && !(depthIdx >= 0 && i === depthIdx + 1));
   const [root, cmd, ...rest] = pos;
   if (!root || !['chain', 'impact'].includes(cmd) || !rest.length) {
-    console.error('usage: graph-query.mjs <projectRoot> chain "<query>" | impact <path>... [--depth N] [--json]');
+    console.error(usage);
     process.exit(1);
   }
-  const graph = loadGraph(path.resolve(root));
+  const projectRoot = path.resolve(root);
+  const graph = loadGraph(projectRoot);
+  // impact paths may be ./relative or absolute; match them as project-relative. Outside the project: keep as typed.
+  const normalise = p => {
+    const rel = path.relative(projectRoot, path.resolve(projectRoot, p));
+    return rel.startsWith('..') ? p : rel;
+  };
+  const targets = cmd === 'impact' ? rest.map(normalise) : rest;
   let starts;
   if (cmd === 'chain') starts = findStart(graph, rest.join(' '));
-  else starts = rest.flatMap(p => [...nodesOfFile(graph, p), ...graph.nodes.filter(n => n.id === `file:${p}`)]);
+  else starts = targets.flatMap(p => [...nodesOfFile(graph, p), ...graph.nodes.filter(n => n.id === `file:${p}`)]);
   if (!starts.length) {
-    const hint = graph.nodes.filter(n => n.type === 'file' && n.filePath?.toLowerCase().includes(path.basename(rest[0]).toLowerCase())).slice(0, 5).map(n => n.filePath);
+    const hint = graph.nodes.filter(n => n.type === 'file' && n.filePath?.toLowerCase().includes(path.basename(targets[0]).toLowerCase())).slice(0, 5).map(n => n.filePath);
     console.error(`No node matches "${rest.join(' ')}".` + (hint.length ? ` Similar files: ${hint.join(', ')}` : ''));
     process.exit(2);
   }

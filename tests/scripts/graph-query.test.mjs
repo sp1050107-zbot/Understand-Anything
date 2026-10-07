@@ -93,4 +93,85 @@ describe('graph-query', () => {
     expect(JSON.parse(ok).files.map(f => f.file)).toContain('c/x.go');
     fs.rmSync(dir, { recursive: true, force: true });
   });
+
+  // --- honesty / input-handling behaviours ---
+  const withGraph = (g, fn) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ua-gq-x-'));
+    fs.mkdirSync(path.join(dir, '.ua'));
+    fs.writeFileSync(path.join(dir, '.ua/knowledge-graph.json'), JSON.stringify(g));
+    try { return fn(dir); } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  };
+  const run = (...a) => spawnSync('node', [SCRIPT, ...a], { encoding: 'utf8' });
+
+  it('does not flag impact as broad when it reaches only some endpoints, and lists them', () => {
+    const g = {
+      nodes: [
+        n('endpoint:r.go:GET /a', 'endpoint', { name: 'GET /a', filePath: 'r.go' }), n('endpoint:r.go:GET /b', 'endpoint', { name: 'GET /b', filePath: 'r.go' }),
+        n('function:a/a.go:A', 'function', { name: 'A', filePath: 'a/a.go' }), n('file:a/a.go', 'file', { filePath: 'a/a.go' }),
+        n('function:b/b.go:B', 'function', { name: 'B', filePath: 'b/b.go' }), n('file:b/b.go', 'file', { filePath: 'b/b.go' }),
+      ],
+      edges: [{ source: 'endpoint:r.go:GET /a', target: 'function:a/a.go:A', type: 'routes' }, { source: 'endpoint:r.go:GET /b', target: 'function:b/b.go:B', type: 'routes' }],
+      layers: [],
+    };
+    withGraph(g, dir => {
+      const out = JSON.parse(run(dir, 'impact', 'a/a.go', '--json').stdout);
+      expect(out.broad).toBe(false);
+      expect(out.totalEndpoints).toBe(2);
+      expect(out.endpoints).toEqual(['GET /a']);
+      const text = run(dir, 'impact', 'a/a.go').stdout;
+      expect(text).not.toMatch(/BROAD/);
+      expect(text).toContain('GET /a');
+      expect(text).not.toContain('GET /b');
+    });
+  });
+
+  it('validates --depth: bad or missing values exit 1 with usage; a valid value keeps the query intact', () => {
+    withGraph(graph, dir => {
+      for (const bad of [['--depth', 'abc'], ['--depth', '0'], ['--depth', '-2'], ['--depth', '1.5']]) {
+        const r = run(dir, 'chain', 'GET /api/v1/x', ...bad);
+        expect(r.status, bad.join(' ')).toBe(1);
+        expect(r.stderr).toMatch(/usage/i);
+      }
+      const last = run(dir, 'chain', 'GET /api/v1/x', '--depth');
+      expect(last.status).toBe(1);
+      expect(last.stderr).toMatch(/usage/i);
+      const ok = run(dir, 'chain', 'GET /api/v1/x', '--depth', '2', '--json');
+      expect(ok.status).toBe(0);
+      expect(JSON.parse(ok.stdout).files.map(f => f.file)).toEqual(['c/x.go', 's/x.go']);
+      // flag before the query and a depth value equal to a positional must not eat the wrong argument
+      const early = run('--depth', '2', dir, 'chain', 'GET /api/v1/x', '--json');
+      expect(JSON.parse(early.stdout).files.map(f => f.file)).toEqual(['c/x.go', 's/x.go']);
+    });
+  });
+
+  it('impact normalises ./relative and absolute paths against the project root', () => {
+    withGraph(graph, dir => {
+      const files = (...a) => JSON.parse(run(dir, 'impact', ...a, '--json').stdout).files.map(f => f.file);
+      const base = files('m/x.go');
+      expect(base).toContain('c/x.go');
+      expect(files('./m/x.go')).toEqual(base);
+      expect(files(path.join(dir, 'm/x.go'))).toEqual(base);
+      const miss = run(dir, 'impact', '/definitely/outside/y.go');
+      expect(miss.status).toBe(2);
+      expect(miss.stderr).toContain('/definitely/outside/y.go');
+    });
+  });
+
+  it('collapses symbol-less deeper files into a "more" line and --all lists them', () => {
+    const g = {
+      nodes: ['a/a.go', 'b/b.go', 'c/c.go', 'd/d.go'].map(f => n(`file:${f}`, 'file', { filePath: f })),
+      edges: [{ source: 'file:a/a.go', target: 'file:b/b.go', type: 'imports' }, { source: 'file:b/b.go', target: 'file:c/c.go', type: 'imports' }, { source: 'file:b/b.go', target: 'file:d/d.go', type: 'imports' }],
+      layers: [],
+    };
+    withGraph(g, dir => {
+      const text = run(dir, 'chain', 'a/a.go', '--depth', '2').stdout;
+      expect(text).toContain('b/b.go');
+      expect(text).toMatch(/\+2 more \(package-level imports\)/);
+      expect(text).not.toContain('c/c.go  [');
+      const all = run(dir, 'chain', 'a/a.go', '--depth', '2', '--all').stdout;
+      expect(all).toContain('c/c.go');
+      expect(all).toContain('d/d.go');
+      expect(all).not.toMatch(/more \(package-level imports\)/);
+    });
+  });
 });
